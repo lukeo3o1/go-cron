@@ -94,6 +94,7 @@ func (s *Scheduler[JobID]) addJob(timers map[string]*Timer[JobID], j *job[JobID]
 	}
 	if s.ctx != nil {
 		j.Context = s.ctx
+		return
 	}
 	s.joblist = append(s.joblist, j)
 }
@@ -109,6 +110,7 @@ func (s *Scheduler[JobID]) setJob(timers map[string]*Timer[JobID], j *job[JobID]
 	}
 	if s.ctx != nil {
 		j.Context, j.cancel = context.WithCancel(s.ctx)
+		return
 	}
 	s.jobmap[j.id] = j
 }
