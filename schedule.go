@@ -65,6 +65,7 @@ func (s *Scheduler[JobID]) newTimer(st Time) *Timer[JobID] {
 			case <-j.Done():
 				t.jobs[i] = nil
 				t.jobs = append(t.jobs[:i], t.jobs[i+1:]...)
+				deleted++
 			default:
 				go j.job.Run(j.Context)
 			}
