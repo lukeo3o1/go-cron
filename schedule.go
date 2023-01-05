@@ -59,7 +59,6 @@ func (t *Timer[JobID]) rangeJob(cb func(j *job[JobID]) bool) {
 			}
 		}
 	}
-	// TODO if job list empty then timer should stop and remove
 }
 
 func (t *Timer[JobID]) safeRangeJob(cb func(j *job[JobID]) bool) {
@@ -78,6 +77,11 @@ func runAllJob[JobID comparable](j *job[JobID]) bool {
 }
 
 func (s *Scheduler[JobID]) newTimer(st Time) *Timer[JobID] {
+	now := time.Now()
+	if d, ok := st.(Deadline); ok && d.IsExpired(now) {
+		return nil
+	}
+
 	t := &Timer[JobID]{}
 	ctx := s.ctx
 	t.time = st
@@ -112,16 +116,46 @@ func (s *Scheduler[JobID]) loadOrStoreTimer(timers map[string]*Timer[JobID], st 
 	key := st.String()
 	t := timers[key]
 	if t == nil {
-		t = s.newTimer(st)
-		timers[key] = t
+		if t = s.newTimer(st); t != nil {
+			timers[key] = t
+		}
 	}
 	return t
 }
 
+func (s *Scheduler[JobID]) removeTimer(timers map[string]*Timer[JobID], timer *Timer[JobID]) {
+	ts := timer.time.String()
+	tt := timers[ts]
+	if tt == timer {
+		tt.timer.Stop()
+		timers[ts] = nil
+		delete(timers, ts)
+	}
+}
+
+func (s *Scheduler[JobID]) removeEmptyJobListTimer(timers map[string]*Timer[JobID], tt *Timer[JobID]) {
+	tt.mu.Lock()
+	defer tt.mu.Unlock()
+	if len(tt.jobs) == 0 {
+		s.removeTimer(timers, tt)
+	}
+}
+
+func (s *Scheduler[JobID]) removeCtxDoneJobAndStopWhenJobListEmptyTimer(timers map[string]*Timer[JobID], t Time) {
+	timer := timers[t.String()]
+	timer.mu.Lock()
+	defer timer.mu.Unlock()
+	timer.rangeJob(rangeAllDoNothing[JobID])
+	if len(timer.jobs) == 0 {
+		s.removeTimer(timers, timer)
+	}
+}
+
 func (s *Scheduler[JobID]) addJob(timers map[string]*Timer[JobID], j *job[JobID]) {
 	if timers != nil {
-		t := s.loadOrStoreTimer(timers, j.time)
-		defer t.addJob(j)
+		if t := s.loadOrStoreTimer(timers, j.time); t != nil {
+			defer t.addJob(j)
+		}
 	}
 	if s.ctx != nil {
 		j.Context = s.ctx
@@ -132,8 +166,9 @@ func (s *Scheduler[JobID]) addJob(timers map[string]*Timer[JobID], j *job[JobID]
 
 func (s *Scheduler[JobID]) setJob(timers map[string]*Timer[JobID], j *job[JobID]) {
 	if timers != nil {
-		t := s.loadOrStoreTimer(timers, j.time)
-		defer t.addJob(j)
+		if t := s.loadOrStoreTimer(timers, j.time); t != nil {
+			defer t.addJob(j)
+		}
 	}
 	oldjob := s.jobmap[j.id]
 	if oldjob != nil && oldjob.cancel != nil {
@@ -146,15 +181,16 @@ func (s *Scheduler[JobID]) setJob(timers map[string]*Timer[JobID], j *job[JobID]
 	s.jobmap[j.id] = j
 }
 
-func (s *Scheduler[JobID]) removeJob(id JobID) {
+func (s *Scheduler[JobID]) removeJob(id JobID) *job[JobID] {
 	j := s.jobmap[id]
 	if j == nil {
-		return
+		return nil
 	}
 	if j.cancel != nil {
 		j.cancel()
 	}
 	delete(s.jobmap, id)
+	return j
 }
 
 func (s *Scheduler[JobID]) runJob(id JobID) {
@@ -187,22 +223,23 @@ func (s *Scheduler[JobID]) run() {
 			}
 			s.addJob(timers, j)
 		case id := <-s.remove:
-			s.removeJob(id)
+			j := s.removeJob(id)
+			s.removeCtxDoneJobAndStopWhenJobListEmptyTimer(timers, j.time)
 		case id := <-s.runjob:
 			s.runJob(id)
 		case <-s.ctx.Done():
+			for _, tt := range timers {
+				tt.timer.Stop()
+			}
 			return
 		case <-s.stop:
 			s.cancel()
 		case timer := <-s.expiredTimer:
-			ts := timer.time.String()
-			tt := timers[ts]
-			if tt == timer {
-				timers[ts] = nil
-				delete(timers, ts)
-			}
+			s.removeTimer(timers, timer)
 		case <-ticker.C:
-			// avoid all goroutines are asleep - deadlock
+			for _, tt := range timers {
+				s.removeEmptyJobListTimer(timers, tt)
+			}
 		}
 	}
 }
