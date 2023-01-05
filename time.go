@@ -11,6 +11,10 @@ type Time interface {
 	String() string
 }
 
+type Deadline interface {
+	IsExpired(time.Time) bool
+}
+
 type Duration struct {
 	d time.Duration
 }

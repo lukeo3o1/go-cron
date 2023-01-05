@@ -7,38 +7,74 @@ import (
 )
 
 type Scheduler[JobID comparable] struct {
-	mu      sync.Mutex
-	ctx     context.Context
-	cancel  context.CancelFunc
-	jobmap  map[JobID]*job[JobID]
-	joblist []*job[JobID]
-	add     chan *job[JobID]
-	remove  chan JobID
-	runjob  chan JobID
-	stop    chan struct{}
+	mu           sync.Mutex
+	ctx          context.Context
+	cancel       context.CancelFunc
+	jobmap       map[JobID]*job[JobID]
+	joblist      []*job[JobID]
+	add          chan *job[JobID]
+	remove       chan JobID
+	runjob       chan JobID
+	stop         chan struct{}
+	expiredTimer chan *Timer[JobID]
 }
 
 func NewScheduler[JobID comparable]() *Scheduler[JobID] {
 	return &Scheduler[JobID]{
-		jobmap: map[JobID]*job[JobID]{},
-		add:    make(chan *job[JobID]),
-		remove: make(chan JobID),
-		runjob: make(chan JobID),
-		stop:   make(chan struct{}, 1),
+		jobmap:       map[JobID]*job[JobID]{},
+		add:          make(chan *job[JobID]),
+		remove:       make(chan JobID),
+		runjob:       make(chan JobID),
+		stop:         make(chan struct{}, 1),
+		expiredTimer: make(chan *Timer[JobID]),
 	}
 }
 
 type Timer[JobID comparable] struct {
-	rw    sync.RWMutex
+	mu    sync.Mutex
 	time  Time
 	timer *time.Timer
 	jobs  []*job[JobID]
 }
 
 func (t *Timer[JobID]) addJob(j *job[JobID]) {
-	t.rw.Lock()
-	defer t.rw.Unlock()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.jobs = append(t.jobs, j)
+}
+
+func (t *Timer[JobID]) rangeJob(cb func(j *job[JobID]) bool) {
+	deleted := 0
+	for idx := range t.jobs {
+		i := idx - deleted
+		j := t.jobs[i]
+		select {
+		case <-j.Done():
+			t.jobs[i] = nil
+			t.jobs = append(t.jobs[:i], t.jobs[i+1:]...)
+			deleted++
+		default:
+			if !cb(j) {
+				return
+			}
+		}
+	}
+	// TODO if job list empty then timer should stop and remove
+}
+
+func (t *Timer[JobID]) safeRangeJob(cb func(j *job[JobID]) bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.rangeJob(cb)
+}
+
+func rangeAllDoNothing[JobID comparable](j *job[JobID]) bool {
+	return true
+}
+
+func runAllJob[JobID comparable](j *job[JobID]) bool {
+	go j.job.Run(j.Context)
+	return true
 }
 
 func (s *Scheduler[JobID]) newTimer(st Time) *Timer[JobID] {
@@ -52,24 +88,19 @@ func (s *Scheduler[JobID]) newTimer(st Time) *Timer[JobID] {
 		default:
 		}
 
-		t.timer.Reset(time.Until(t.time.Next(time.Now())))
+		now := time.Now()
 
-		t.rw.RLock()
-		defer t.rw.RUnlock()
-
-		deleted := 0
-		for idx := range t.jobs {
-			i := idx - deleted
-			j := t.jobs[i]
+		if d, ok := t.time.(Deadline); ok && d.IsExpired(now) {
 			select {
-			case <-j.Done():
-				t.jobs[i] = nil
-				t.jobs = append(t.jobs[:i], t.jobs[i+1:]...)
-				deleted++
-			default:
-				go j.job.Run(j.Context)
+			case <-ctx.Done():
+			case s.expiredTimer <- t:
 			}
+			return
 		}
+
+		t.timer.Reset(time.Until(t.time.Next(now)))
+
+		t.safeRangeJob(runAllJob[JobID])
 	})
 	return t
 }
@@ -145,6 +176,8 @@ func (s *Scheduler[JobID]) run() {
 	for _, j := range s.joblist {
 		s.addJob(timers, j)
 	}
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
 	for {
 		select {
 		case j := <-s.add:
@@ -161,6 +194,15 @@ func (s *Scheduler[JobID]) run() {
 			return
 		case <-s.stop:
 			s.cancel()
+		case timer := <-s.expiredTimer:
+			ts := timer.time.String()
+			tt := timers[ts]
+			if tt == timer {
+				timers[ts] = nil
+				delete(timers, ts)
+			}
+		case <-ticker.C:
+			// avoid all goroutines are asleep - deadlock
 		}
 	}
 }
