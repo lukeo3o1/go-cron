@@ -14,6 +14,16 @@ type job[ID comparable] struct {
 	job    Job
 }
 
+func (j *job[JobID]) SetContext(ctx context.Context) {
+	j.Context = ctx
+}
+
+func (j *job[JobID]) SetCancelContext(ctx context.Context) {
+	if ctx != nil {
+		j.Context, j.cancel = context.WithCancel(ctx)
+	}
+}
+
 type JobFunc func(ctx context.Context)
 
 func (f JobFunc) Run(ctx context.Context) { f(ctx) }
